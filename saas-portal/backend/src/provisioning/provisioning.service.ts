@@ -38,7 +38,6 @@ export class ProvisioningService {
     let container;
 
     try {
-      // ... (Giữ nguyên cấu hình Docker như bạn đã làm đúng ở bước trước) ...
       // Lưu ý: Đảm bảo biến Env dùng 'search_path' thay vì 'currentSchema'
       container = await docker.createContainer({
         Image: 'mattermost/mattermost-team-edition:9.5',

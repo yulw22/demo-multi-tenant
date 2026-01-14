@@ -1,155 +1,252 @@
 import { Injectable, Logger } from '@nestjs/common';
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 
 @Injectable()
 export class MattermostSeederService {
   private readonly logger = new Logger(MattermostSeederService.name);
 
-  // 1. Hàm đợi Server khởi động (Quan trọng để tránh lỗi Connection Refused)
   async waitForHealth(baseUrl: string): Promise<void> {
-    this.logger.log(`⏳ Waiting for Mattermost at ${baseUrl}...`);
     const healthUrl = `${baseUrl}/api/v4/system/ping`;
-
-    // Thử lại 30 lần, mỗi lần cách nhau 2s (Tổng 60s)
-    for (let i = 0; i < 30; i++) {
+    this.logger.log(`⏳ Checking Health: ${healthUrl}`);
+    for (let i = 0; i < 40; i++) {
       try {
-        await axios.get(healthUrl);
-        this.logger.log('✅ Mattermost is healthy!');
+        await axios.get(healthUrl, { timeout: 2000 });
+        this.logger.log('✅ Server is UP!');
         return;
-      } catch (error) {
-        this.logger.debug(`Ping failed (${i + 1}/30). Retrying in 2s...`);
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+      } catch (e) {
+        if (i % 5 === 0) this.logger.debug(`...waiting (${i}/40)`);
+        await new Promise((r) => setTimeout(r, 2000));
       }
     }
-    throw new Error('Mattermost startup timeout after 60s');
+    throw new Error('Server Startup Timeout');
   }
 
-  // 2. Tạo System Admin đầu tiên (Mattermost cho phép tạo user đầu không cần auth)
   async createFirstAdmin(baseUrl: string, email: string) {
-    this.logger.log('🔑 Creating System Admin...');
-    const password = 'Admin@123456'; // Password mặc định
+    this.logger.log(`🔑 Setup System Admin: ${email}`);
+    const password = 'Admin@123456';
     const username = 'sysadmin';
 
     try {
-      // Tạo User
-      const userRes = await axios.post(`${baseUrl}/api/v4/users`, {
+      await axios.post(`${baseUrl}/api/v4/users`, {
         email,
         username,
         password,
       });
+    } catch (e) {
+      /* Ignore exists */
+    }
 
-      // Login để lấy Token
-      const loginRes = await axios.post(`${baseUrl}/api/v4/users/login`, {
-        login_id: email,
+    try {
+      const res = await axios.post(`${baseUrl}/api/v4/users/login`, {
+        login_id: username,
         password,
       });
-
-      const token = loginRes.headers['token'];
-      this.logger.log('✅ System Admin created & Logged in.');
-
-      return { token, username, password };
-    } catch (error) {
-      // Nếu user đã tồn tại (do deploy lại), thử login luôn
-      if (error.response?.status === 400 || error.response?.status === 403) {
-        this.logger.warn('User might already exist, trying to login...');
-        const loginRes = await axios.post(`${baseUrl}/api/v4/users/login`, {
-          login_id: email,
-          password,
-        });
-        return { token: loginRes.headers['token'], username, password };
-      }
-      this.logger.error('Failed to create admin', error.response?.data);
-      throw error;
+      return { token: res.headers['token'], username, password };
+    } catch (e) {
+      this.logger.error('❌ Admin Login Failed.');
+      throw e;
     }
   }
 
-  // 3. Bơm dữ liệu từ Config JSON
   async seedData(baseUrl: string, token: string, config: any) {
-    this.logger.log('🌱 Seeding data from config...');
-    const headers = { Authorization: `Bearer ${token}` };
+    this.logger.log('🚀 START SEEDING (WITH AUTO-CLEANUP)...');
+    const client = axios.create({
+      baseURL: `${baseUrl}/api/v4`,
+      headers: { Authorization: `Bearer ${token}` },
+    });
 
-    if (!config) {
-      this.logger.warn('No config found to seed.');
-      return;
-    }
+    const teamIdMap = new Map<string, string>();
+    const channelIdMap = new Map<string, string>();
 
-    // A. Tạo Teams (Lớp học)
-    const teamMap = new Map<string, string>(); // Map: class_code -> team_id
-    if (config.teams) {
-      for (const team of config.teams) {
+    // 1. TẠO TEAM & CHANNEL
+    const teams = config.teams || [];
+    const channelsConfig = config.channels || [];
+
+    for (const t of teams) {
+      const teamHandle = this.sanitize(t.code);
+      let teamId = '';
+
+      // 1.1 Tạo Team
+      try {
+        const res = await client.post('/teams', {
+          name: teamHandle,
+          display_name: t.name,
+          type: 'I',
+        });
+        teamId = res.data.id;
+      } catch (e) {
+        if (e.response?.status === 400) {
+          const exist = await client.get(`/teams/name/${teamHandle}`);
+          teamId = exist.data.id;
+        }
+      }
+
+      if (!teamId) continue;
+      teamIdMap.set(t.code, teamId);
+      this.logger.debug(`Processing Team: ${t.name}`);
+
+      // 1.2 Cleanup & Rename Default Channels
+      try {
+        const offTopic = await client.get(
+          `/teams/${teamId}/channels/name/off-topic`,
+        );
+        await client.delete(`/channels/${offTopic.data.id}`); // Archive Off-Topic
+
+        const townSquare = await client.get(
+          `/teams/${teamId}/channels/name/town-square`,
+        );
+        await client.put(`/channels/${townSquare.data.id}/patch`, {
+          display_name: 'Thông báo chung',
+          header: 'Kênh thông báo chính thức của lớp học',
+        });
+        // Lưu lại ID của Town Square để tí nữa dọn rác
+        channelIdMap.set(`${t.code}_TOWNSQUARE`, townSquare.data.id);
+      } catch (e) {
+        /* Ignore cleanup err */
+      }
+
+      // 1.3 Tạo Channel Môn học
+      for (const c of channelsConfig) {
+        const chanHandle = this.sanitize(c.code);
         try {
-          // name: phải viết thường, không dấu, không cách (vd: 10a1)
-          const cleanName = team.code.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const res = await axios.post(
-            `${baseUrl}/api/v4/teams`,
-            {
-              name: cleanName,
-              display_name: team.name,
-              type: 'I', // Invite only
-            },
-            { headers },
-          );
-          teamMap.set(team.code, res.data.id);
-          this.logger.log(`Created Team: ${team.name}`);
-        } catch (e) {
-          this.logger.error(
-            `Failed to create team ${team.code}`,
-            e.response?.data,
-          );
+          const res = await client.post('/channels', {
+            team_id: teamId,
+            name: chanHandle,
+            display_name: c.name,
+            type: c.type === 'P' ? 'P' : 'O',
+          });
+          channelIdMap.set(`${t.code}_${c.code}`, res.data.id);
+        } catch (ce) {
+          if (ce.response?.status === 400) {
+            try {
+              const exist = await client.get(
+                `/teams/${teamId}/channels/name/${chanHandle}`,
+              );
+              channelIdMap.set(`${t.code}_${c.code}`, exist.data.id);
+            } catch {}
+          }
         }
       }
     }
 
-    // B. Tạo Users và Add vào Team
-    if (config.users) {
-      for (const user of config.users) {
+    // 2. TẠO USER & ADD VÀO CHANNEL
+    const users = config.users || [];
+    for (const u of users) {
+      const uHandle = this.sanitize(u.username);
+      let userId = '';
+
+      try {
+        const res = await client.post('/users', {
+          email: u.email,
+          username: uHandle,
+          password: u.password || 'Student@123',
+          first_name: u.fullname,
+        });
+        userId = res.data.id;
+      } catch (e) {
+        if (e.response?.status === 400) {
+          try {
+            const found = await client.post('/users/search', { term: u.email });
+            if (found.data.length > 0) userId = found.data[0].id;
+          } catch {}
+        }
+      }
+
+      if (!userId) continue;
+
+      const teamId = teamIdMap.get(u.class_code);
+      if (teamId) {
         try {
-          // Tạo User
-          const userRes = await axios.post(
-            `${baseUrl}/api/v4/users`,
-            {
-              email: user.email,
-              username: user.username,
-              password: user.password,
-              first_name: user.fullname,
-            },
-            { headers },
-          );
+          await client.post(`/teams/${teamId}/members`, {
+            team_id: teamId,
+            user_id: userId,
+          });
+        } catch {}
+        if (u.role === 'teacher') {
+          try {
+            await client.put(`/teams/${teamId}/members/${userId}/roles`, {
+              roles: 'team_user team_admin',
+            });
+          } catch {}
+        }
 
-          const userId = userRes.data.id;
+        // Auto Join Channels
+        for (const c of channelsConfig) {
+          const channelId = channelIdMap.get(`${u.class_code}_${c.code}`);
+          if (channelId) {
+            let shouldJoin = false;
+            if (c.type !== 'P') shouldJoin = true;
+            else {
+              if (
+                c.code === 'PARENTS' &&
+                (u.role === 'parent' || u.role === 'teacher')
+              )
+                shouldJoin = true;
+              else if (c.code === 'TEACHERS' && u.role === 'teacher')
+                shouldJoin = true;
+            }
 
-          // Add vào Team (Lớp)
-          if (user.class_code && teamMap.has(user.class_code)) {
-            const teamId = teamMap.get(user.class_code);
-
-            // Add member
-            await axios.post(
-              `${baseUrl}/api/v4/teams/${teamId}/members`,
-              {
-                team_id: teamId,
-                user_id: userId,
-              },
-              { headers },
-            );
-
-            // Nếu là GV -> Set làm Team Admin
-            if (user.role === 'teacher') {
-              // Update roles (Logic update role hơi phức tạp, tạm thời add member trước)
-              // Mattermost API update role: PUT /api/v4/teams/{team_id}/members/{user_id}/roles
-              await axios.put(
-                `${baseUrl}/api/v4/teams/${teamId}/members/${userId}/roles`,
-                {
-                  roles: 'team_user team_admin',
-                },
-                { headers },
-              );
+            if (shouldJoin) {
+              try {
+                await client.post(`/channels/${channelId}/members`, {
+                  user_id: userId,
+                });
+              } catch {}
             }
           }
-        } catch (e) {
-          this.logger.warn(`User ${user.username} maybe exists or error.`);
         }
       }
     }
-    this.logger.log('✅ Seeding completed.');
+
+    // 3. CLEANUP SYSTEM MESSAGES (MỚI)
+    this.logger.log('🧹 Cleaning up system messages (User joined)...');
+
+    // Duyệt qua tất cả channel ID đã lưu để xóa post
+    for (const [key, channelId] of channelIdMap.entries()) {
+      await this.clearChannelPosts(client, channelId);
+    }
+
+    this.logger.log('✅ SEEDING FINISHED & CLEANED.');
+  }
+
+  // --- HÀM XÓA POST ---
+  private async clearChannelPosts(client: AxiosInstance, channelId: string) {
+    try {
+      // Lấy 200 post gần nhất (thường là post 'user joined')
+      const postsRes = await client.get(
+        `/channels/${channelId}/posts?per_page=200`,
+      );
+      const posts = postsRes.data.posts;
+      const order = postsRes.data.order; // Mảng ID post theo thứ tự
+
+      if (!order || order.length === 0) return;
+
+      this.logger.debug(
+        `   🗑️ Deleting ${order.length} posts in channel ${channelId}`,
+      );
+
+      // Xóa từng post (Mattermost API chưa support bulk delete clean)
+      // Dùng Promise.all để xóa song song cho nhanh
+      const deletePromises = order.map((postId) =>
+        client.delete(`/posts/${postId}`).catch(() => {}),
+      );
+
+      await Promise.all(deletePromises);
+    } catch (e) {
+      this.logger.warn(`Failed to clean channel ${channelId}: ${e.message}`);
+    }
+  }
+
+  private sanitize(str: string): string {
+    if (!str) return 'unknown';
+    return str
+      .toString()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[đĐ]/g, 'd')
+      .replace(/[^a-z0-9]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
   }
 }
