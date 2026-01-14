@@ -1,23 +1,21 @@
-import { TenantsService } from './tenants.service';
-import { CreateTenantDto } from './dto/create-tenant.dto';
 import {
   BadRequestException,
   Body,
   Controller,
   Get,
-  InternalServerErrorException,
-  NotFoundException,
   Param,
   Post,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
+import { TenantsService } from './tenants.service';
+import { CreateTenantDto } from './dto/create-tenant.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { ExcelParserService } from './excel-parser.service';
-import type { Express } from 'express';
-import { TenantStatus } from './tenants.entity';
+import { TenantStatus } from './tenants.entity'; // Import Enum
 import { ProvisioningService } from 'src/provisioning/provisioning.service';
+import type { Express } from 'express';
 
 @Controller('tenants')
 export class TenantsController {
@@ -52,6 +50,8 @@ export class TenantsController {
       throw new BadRequestException('File is required');
     }
     const parsed = this.excelParserService.parseSchoolConfig(file.buffer);
+
+    // Lưu config và chuyển trạng thái sang READY
     await this.tenantsService.saveConfig(
       id,
       parsed as unknown as Record<string, unknown>,
@@ -61,35 +61,41 @@ export class TenantsController {
 
   @Post(':id/deploy')
   async deploy(@Param('id') id: string) {
+    // 1. Tìm Tenant
     const tenant = await this.tenantsService.findOne(id);
-    if (!tenant) {
-      throw new NotFoundException('Tenant not found');
-    }
-    if (tenant.deploymentStatus !== TenantStatus.READY) {
-      throw new BadRequestException('Tenant configuration missing');
+
+    // SỬA: Dùng Enum để so sánh cho chuẩn
+    if (tenant?.deploymentStatus !== TenantStatus.READY) {
+      throw new BadRequestException(
+        'Tenant not ready for deployment (Upload config first)',
+      );
     }
 
-    tenant.deploymentStatus = TenantStatus.DEPLOYING;
-    await this.tenantsService.save(tenant);
+    // 2. Update status -> DEPLOYING
+    await this.tenantsService.updateStatus(id, TenantStatus.DEPLOYING);
 
     try {
+      // 3. Gọi Deploy (Hàm này trả về credentials và containerId)
+      // Đảm bảo method trong ProvisioningService tên là deployTenant nhé
       const result = await this.provisioningService.deployTenant(tenant);
-      tenant.containerId = result.containerId;
-      tenant.deploymentStatus = TenantStatus.ACTIVE;
-      await this.tenantsService.save(tenant);
+
+      // 4. Update status -> ACTIVE (Kèm containerId)
+      // Hàm updateStatus bây giờ đã nhận tham số thứ 3
+      await this.tenantsService.updateStatus(
+        id,
+        TenantStatus.ACTIVE,
+        result.containerId,
+      );
 
       return {
-        message: 'Deployment succeeded',
-        tenant,
-        adminCredentials: {
-          email: result.sysadminEmail,
-          password: result.sysadminPassword,
-        },
+        message: 'Deployment successful',
+        credentials: result,
       };
     } catch (error) {
-      tenant.deploymentStatus = TenantStatus.ERROR;
-      await this.tenantsService.save(tenant);
-      throw new InternalServerErrorException('Deployment failed');
+      // 5. Nếu lỗi -> Update status -> FAILED
+      // Bắt buộc phải catch lỗi để DB không bị treo ở trạng thái DEPLOYING mãi mãi
+      await this.tenantsService.updateStatus(id, TenantStatus.FAILED);
+      throw error;
     }
   }
 }

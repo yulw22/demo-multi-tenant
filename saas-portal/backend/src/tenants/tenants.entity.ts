@@ -13,6 +13,7 @@ export enum TenantStatus {
   PROVISIONING = 'PROVISIONING',
   ACTIVE = 'ACTIVE',
   ERROR = 'ERROR',
+  FAILED = 'FAILED',
 }
 
 @Entity({ name: 'tenants' })

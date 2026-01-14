@@ -3,41 +3,26 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Tenant, TenantStatus } from './tenants.entity';
 import { CreateTenantDto } from './dto/create-tenant.dto';
-import { ProvisioningService } from 'src/provisioning/provisioning.service';
+// Bỏ import ProvisioningService ở đây để tránh vòng lặp (Circular Dependency)
+// vì Service này không cần gọi Deploy nữa (Controller sẽ gọi)
 
 @Injectable()
 export class TenantsService {
   constructor(
     @InjectRepository(Tenant)
     private readonly tenantsRepo: Repository<Tenant>,
-    private readonly provisioningService: ProvisioningService,
   ) {}
 
-  async create(createTenantDto: CreateTenantDto): Promise<{
-    tenant: Tenant;
-    adminCredentials: { email: string; password: string };
-  }> {
+  // --- SỬA LOGIC CŨ ---
+  // Hàm này giờ chỉ tạo Tenant ở trạng thái DRAFT hoặc PROVISIONING (chờ config)
+  // Không tự động gọi Docker nữa để đảm bảo quy trình Concierge.
+  async create(createTenantDto: CreateTenantDto): Promise<Tenant> {
     const tenant = this.tenantsRepo.create({
       ...createTenantDto,
-      deploymentStatus: TenantStatus.PROVISIONING,
+      deploymentStatus: TenantStatus.DRAFT, // Mặc định là Draft
+      containerId: null,
     });
-    const savedTenant = await this.tenantsRepo.save(tenant);
-
-    try {
-      const { containerId, sysadminEmail, sysadminPassword } =
-        await this.provisioningService.provisionTenant(savedTenant);
-      savedTenant.containerId = containerId;
-      savedTenant.deploymentStatus = TenantStatus.ACTIVE;
-      const finalTenant = await this.tenantsRepo.save(savedTenant);
-      return {
-        tenant: finalTenant,
-        adminCredentials: { email: sysadminEmail, password: sysadminPassword },
-      };
-    } catch (error) {
-      savedTenant.deploymentStatus = TenantStatus.ERROR;
-      await this.tenantsRepo.save(savedTenant);
-      throw error;
-    }
+    return this.tenantsRepo.save(tenant);
   }
 
   async createDraft(createTenantDto: CreateTenantDto): Promise<Tenant> {
@@ -50,7 +35,7 @@ export class TenantsService {
   }
 
   findAll(): Promise<Tenant[]> {
-    return this.tenantsRepo.find();
+    return this.tenantsRepo.find({ order: { createdAt: 'DESC' } });
   }
 
   findOne(id: string): Promise<Tenant | null> {
@@ -61,10 +46,23 @@ export class TenantsService {
     return this.tenantsRepo.save(tenant);
   }
 
-  async updateStatus(id: string, status: TenantStatus): Promise<Tenant> {
+  // --- SỬA LỖI QUAN TRỌNG TẠI ĐÂY ---
+  // Thêm tham số containerId (optional)
+  async updateStatus(
+    id: string,
+    status: TenantStatus,
+    containerId?: string, // <--- Thêm cái này
+  ): Promise<Tenant> {
     const tenant = await this.findOne(id);
     if (!tenant) throw new NotFoundException('Tenant not found');
+
     tenant.deploymentStatus = status;
+
+    // Nếu có containerId truyền vào thì cập nhật luôn
+    if (containerId) {
+      tenant.containerId = containerId;
+    }
+
     return this.tenantsRepo.save(tenant);
   }
 

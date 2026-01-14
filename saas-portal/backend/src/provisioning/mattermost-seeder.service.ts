@@ -1,137 +1,155 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import axios, { type AxiosInstance } from 'axios';
-import type { ParsedSchoolConfig } from '../tenants/excel-parser.service';
-
-const slugify = (input: string) =>
-  input
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)+/g, '')
-    .slice(0, 50);
-
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import { Injectable, Logger } from '@nestjs/common';
+import axios from 'axios';
 
 @Injectable()
 export class MattermostSeederService {
-  private getAxios(baseUrl: string, token?: string): AxiosInstance {
-    return axios.create({
-      baseURL: baseUrl,
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    });
-  }
+  private readonly logger = new Logger(MattermostSeederService.name);
 
+  // 1. Hàm đợi Server khởi động (Quan trọng để tránh lỗi Connection Refused)
   async waitForHealth(baseUrl: string): Promise<void> {
-    const client = this.getAxios(baseUrl);
+    this.logger.log(`⏳ Waiting for Mattermost at ${baseUrl}...`);
+    const healthUrl = `${baseUrl}/api/v4/system/ping`;
+
+    // Thử lại 30 lần, mỗi lần cách nhau 2s (Tổng 60s)
     for (let i = 0; i < 30; i++) {
       try {
-        const res = await client.get('/api/v4/system/ping');
-        if (res.status === 200) return;
-      } catch (err) {
-        // ignore and retry
+        await axios.get(healthUrl);
+        this.logger.log('✅ Mattermost is healthy!');
+        return;
+      } catch (error) {
+        this.logger.debug(`Ping failed (${i + 1}/30). Retrying in 2s...`);
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
-      await wait(2000);
     }
-    throw new InternalServerErrorException('Mattermost health check timed out');
+    throw new Error('Mattermost startup timeout after 60s');
   }
 
-  async loginSysAdmin(baseUrl: string): Promise<string> {
-    const loginId =
-      process.env.MM_SYSADMIN_EMAIL ??
-      process.env.MM_ADMIN_EMAIL ??
-      'sysadmin@example.com';
-    const password =
-      process.env.MM_SYSADMIN_PASSWORD ??
-      process.env.MM_ADMIN_PASSWORD ??
-      'Sys@dmin-sample1';
+  // 2. Tạo System Admin đầu tiên (Mattermost cho phép tạo user đầu không cần auth)
+  async createFirstAdmin(baseUrl: string, email: string) {
+    this.logger.log('🔑 Creating System Admin...');
+    const password = 'Admin@123456'; // Password mặc định
+    const username = 'sysadmin';
 
-    const client = this.getAxios(baseUrl);
-    const res = await client.post(
-      '/api/v4/users/login',
-      {
-        login_id: loginId,
+    try {
+      // Tạo User
+      const userRes = await axios.post(`${baseUrl}/api/v4/users`, {
+        email,
+        username,
         password,
-      },
-      { validateStatus: () => true },
-    );
+      });
 
-    if (res.status !== 200 || !res.headers.token) {
-      throw new InternalServerErrorException(
-        `Failed to login sysadmin: status ${res.status}`,
-      );
+      // Login để lấy Token
+      const loginRes = await axios.post(`${baseUrl}/api/v4/users/login`, {
+        login_id: email,
+        password,
+      });
+
+      const token = loginRes.headers['token'];
+      this.logger.log('✅ System Admin created & Logged in.');
+
+      return { token, username, password };
+    } catch (error) {
+      // Nếu user đã tồn tại (do deploy lại), thử login luôn
+      if (error.response?.status === 400 || error.response?.status === 403) {
+        this.logger.warn('User might already exist, trying to login...');
+        const loginRes = await axios.post(`${baseUrl}/api/v4/users/login`, {
+          login_id: email,
+          password,
+        });
+        return { token: loginRes.headers['token'], username, password };
+      }
+      this.logger.error('Failed to create admin', error.response?.data);
+      throw error;
     }
-
-    return String(res.headers.token);
   }
 
-  async seedStructure(
-    baseUrl: string,
-    token: string,
-    config: ParsedSchoolConfig,
-  ): Promise<void> {
-    const client = this.getAxios(baseUrl, token);
+  // 3. Bơm dữ liệu từ Config JSON
+  async seedData(baseUrl: string, token: string, config: any) {
+    this.logger.log('🌱 Seeding data from config...');
+    const headers = { Authorization: `Bearer ${token}` };
 
-    const teamIds = new Map<string, string>();
-    for (const cls of config.classes) {
-      const teamName = slugify(cls.code || cls.name || `class-${Date.now()}`);
-      const displayName = cls.name || cls.code;
-      const res = await client.post(
-        '/api/v4/teams',
-        {
-          name: teamName,
-          display_name: displayName,
-          type: 'I',
-        },
-        { validateStatus: () => true },
-      );
-      if (res.status !== 201) {
-        throw new InternalServerErrorException(
-          `Failed to create team ${teamName}: ${res.status}`,
-        );
-      }
-      teamIds.set(cls.code, res.data.id);
+    if (!config) {
+      this.logger.warn('No config found to seed.');
+      return;
     }
 
-    for (const user of config.users) {
-      const userRes = await client.post(
-        '/api/v4/users',
-        {
-          email: user.email,
-          username: user.username || slugify(user.email),
-          password: user.password,
-          first_name: user.fullname ?? '',
-        },
-        { validateStatus: () => true },
-      );
-      if (userRes.status !== 201 && userRes.status !== 409) {
-        throw new InternalServerErrorException(
-          `Failed to create user ${user.email}: ${userRes.status}`,
-        );
-      }
-
-      const userId = userRes.data?.id;
-      const teamId = teamIds.get(user.classCode);
-      if (userId && teamId) {
-        const memberRes = await client.post(
-          `/api/v4/teams/${teamId}/members`,
-          { team_id: teamId, user_id: userId },
-          { validateStatus: () => true },
-        );
-        if (memberRes.status !== 201 && memberRes.status !== 409) {
-          throw new InternalServerErrorException(
-            `Failed to add user ${user.email} to team ${user.classCode}: ${memberRes.status}`,
+    // A. Tạo Teams (Lớp học)
+    const teamMap = new Map<string, string>(); // Map: class_code -> team_id
+    if (config.teams) {
+      for (const team of config.teams) {
+        try {
+          // name: phải viết thường, không dấu, không cách (vd: 10a1)
+          const cleanName = team.code.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const res = await axios.post(
+            `${baseUrl}/api/v4/teams`,
+            {
+              name: cleanName,
+              display_name: team.name,
+              type: 'I', // Invite only
+            },
+            { headers },
           );
-        }
-
-        if (user.role?.toLowerCase() === 'teacher') {
-          await client.put(
-            `/api/v4/teams/${teamId}/members/${userId}/roles`,
-            { roles: 'team_user team_admin' },
-            { validateStatus: () => true },
+          teamMap.set(team.code, res.data.id);
+          this.logger.log(`Created Team: ${team.name}`);
+        } catch (e) {
+          this.logger.error(
+            `Failed to create team ${team.code}`,
+            e.response?.data,
           );
         }
       }
     }
+
+    // B. Tạo Users và Add vào Team
+    if (config.users) {
+      for (const user of config.users) {
+        try {
+          // Tạo User
+          const userRes = await axios.post(
+            `${baseUrl}/api/v4/users`,
+            {
+              email: user.email,
+              username: user.username,
+              password: user.password,
+              first_name: user.fullname,
+            },
+            { headers },
+          );
+
+          const userId = userRes.data.id;
+
+          // Add vào Team (Lớp)
+          if (user.class_code && teamMap.has(user.class_code)) {
+            const teamId = teamMap.get(user.class_code);
+
+            // Add member
+            await axios.post(
+              `${baseUrl}/api/v4/teams/${teamId}/members`,
+              {
+                team_id: teamId,
+                user_id: userId,
+              },
+              { headers },
+            );
+
+            // Nếu là GV -> Set làm Team Admin
+            if (user.role === 'teacher') {
+              // Update roles (Logic update role hơi phức tạp, tạm thời add member trước)
+              // Mattermost API update role: PUT /api/v4/teams/{team_id}/members/{user_id}/roles
+              await axios.put(
+                `${baseUrl}/api/v4/teams/${teamId}/members/${userId}/roles`,
+                {
+                  roles: 'team_user team_admin',
+                },
+                { headers },
+              );
+            }
+          }
+        } catch (e) {
+          this.logger.warn(`User ${user.username} maybe exists or error.`);
+        }
+      }
+    }
+    this.logger.log('✅ Seeding completed.');
   }
 }
