@@ -5,12 +5,14 @@ import AdminLayout from "./layouts/AdminLayout";
 import LeadsList from "./pages/admin/LeadsList";
 import TenantsList from "./pages/admin/TenantsList";
 import TenantDetail from "./pages/admin/TenantDetail";
+import LoginPage from "./pages/auth/LoginPage";
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<LandingPage />} />
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/admin" element={<AdminLayout />}>
           <Route path="leads" element={<LeadsList />} />
           <Route path="tenants" element={<TenantsList />} />
